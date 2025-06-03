@@ -35,6 +35,7 @@ from .constants import InteractionType,\
                        INVALID_SHAPE,\
                        INVALID_PRIMITIVE
 from .path_solvers import PathSolver, Paths
+from .delta_path_solvers import DeltaPathSolver
 from .radio_map_solvers import RadioMapSolver, RadioMap
 from .preview import Previewer
 from .scene_object import SceneObject
