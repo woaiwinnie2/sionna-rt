@@ -13,7 +13,6 @@ from sionna.rt.constants import InteractionType, INVALID_SHAPE,\
     INVALID_PRIMITIVE
 from sionna.rt.utils import theta_phi_from_unit_vec
 
-
 class PathsBuffer:
     r"""
     Class used to store the paths during their computation
@@ -316,9 +315,8 @@ class PathsBuffer:
         :param k_rx: Directions of arrival of the paths
         :param active: Flags specifying active paths. Inactive paths are not added.
         """
-
+        # print([depth.state,indices.state,sample_data.src_indices.state,valid.state,tgt_index.state,k_tx.state,k_rx.state,active.state])
         depth_dim_size = self._depth_dim_size
-
         # Update the valid flag
         dr.scatter(self._valid, valid, indices, active=active)
         # Update the source index
@@ -430,7 +428,6 @@ class PathsBuffer:
                        num_paths*depth_dim_size, shrink=True),
             shape=(num_paths, depth_dim_size)
         )
-
         self._buffer_size = num_paths
 
     def trim_and_replicate(self) -> "PathsBuffer":
@@ -819,3 +816,44 @@ class PathsBuffer:
         ind = dr.arange(mi.UInt, self.buffer_size)*self.depth_dim_size\
                     + depth - 1
         dr.scatter(tensor.array, value, ind, active)
+
+def union_path_buffer(buffers:list[PathsBuffer]) -> PathsBuffer:
+    # Ensure all buffers have the same max_depth
+    max_depth = buffers[0].max_depth
+    if not all(buffer.max_depth == max_depth for buffer in buffers):
+        raise ValueError("All PathsBuffer objects must have the same max_depth")
+
+    # Calculate the total buffer size
+    total_buffer_size = sum(buffer.buffer_size for buffer in buffers)
+
+    # Create a new PathsBuffer with the combined buffer size
+    union_buffer = PathsBuffer(total_buffer_size, max_depth)
+
+    # Initialize offset for copying data
+    offset = 0
+
+    for buffer in buffers:
+        size = buffer.buffer_size
+
+        # Copy data from each buffer into the union buffer
+        dr.scatter(union_buffer.valid, buffer.valid, dr.arange(mi.UInt, size) + offset)
+        dr.scatter(union_buffer.source_indices, buffer.source_indices, dr.arange(mi.UInt, size) + offset)
+        dr.scatter(union_buffer.target_indices, buffer.target_indices, dr.arange(mi.UInt, size) + offset)
+        dr.scatter(union_buffer.theta_t, buffer.theta_t, dr.arange(mi.UInt, size) + offset)
+        dr.scatter(union_buffer.phi_t, buffer.phi_t, dr.arange(mi.UInt, size) + offset)
+        dr.scatter(union_buffer.theta_r, buffer.theta_r, dr.arange(mi.UInt, size) + offset)
+        dr.scatter(union_buffer.phi_r, buffer.phi_r, dr.arange(mi.UInt, size) + offset)
+
+        depth_dim_size = buffer.depth_dim_size
+        for d in range(depth_dim_size):
+            indices_t = dr.arange(mi.UInt, size) * depth_dim_size + d
+            dr.scatter(union_buffer.interaction_types.array, buffer.interaction_types.array, indices_t + offset * depth_dim_size)
+            dr.scatter(union_buffer.vertices_x.array, buffer.vertices_x.array, indices_t + offset * depth_dim_size)
+            dr.scatter(union_buffer.vertices_y.array, buffer.vertices_y.array, indices_t + offset * depth_dim_size)
+            dr.scatter(union_buffer.vertices_z.array, buffer.vertices_z.array, indices_t + offset * depth_dim_size)
+            dr.scatter(union_buffer.shapes.array, buffer.shapes.array, indices_t + offset * depth_dim_size)
+            dr.scatter(union_buffer.primitives.array, buffer.primitives.array, indices_t + offset * depth_dim_size)
+
+        offset += size
+
+    return union_buffer

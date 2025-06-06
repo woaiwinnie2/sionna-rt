@@ -141,7 +141,7 @@ class DeltaPathSolver:
         self._image_method.loop_mode = mode
         self._field_calculator.loop_mode = mode
 
-    def __call__(self,
+    def solve_initial(self,
                  scene : Scene,
                  delta_scene : Scene,
                  max_depth : int = 3,
@@ -187,7 +187,7 @@ class DeltaPathSolver:
                        tgt_orientations)
 
         # Generate candidates
-        paths_buffer = self._candidate_generator(
+        static_paths_buffer,delta_paths_buffer = self._candidate_generator(
             mi_scene=scene.mi_scene,
             delta_scene=delta_scene,
             src_positions=src_positions,
@@ -202,29 +202,57 @@ class DeltaPathSolver:
             seed=seed
         )
 
-        paths_buffer.schedule()
+        static_paths_buffer.schedule()
+        delta_paths_buffer.schedule()
         dr.eval()
 
         # Shrink the paths buffer to fit the number of paths effectively found
-        paths_buffer.shrink()
+        static_paths_buffer.shrink()
+        dr.print("Static number of candidates found: {}".format(static_paths_buffer._paths_counter))
+        delta_paths_buffer.shrink()
+        dr.print("Delta number of candidates found: {}".format(delta_paths_buffer._paths_counter))
 
         # Detach the paths geometry to avoid differentiation through the
         # candidate generator
-        paths_buffer.detach_geometry()
+        static_paths_buffer.detach_geometry()
+        delta_paths_buffer.detach_geometry()
 
         # Solve specular chains and suffixes
-        paths_buffer = self._image_method(
+        static_paths_buffer = self._image_method(
             scene=scene.mi_scene,
-            paths=paths_buffer,
+            paths=static_paths_buffer,
+            src_positions=src_positions,
+            tgt_positions=tgt_positions
+            )
+        
+        delta_paths_buffer = self._image_method(
+            scene=scene.mi_scene,
+            paths=delta_paths_buffer,
             src_positions=src_positions,
             tgt_positions=tgt_positions
             )
 
         # Compute channel coefficients and delays
-        paths_buffer = self._field_calculator(
+        static_paths_buffer = self._field_calculator(
             scene=scene.mi_scene,
             wavelength=scene.wavelength,
-            paths=paths_buffer,
+            paths=static_paths_buffer,
+            samples_per_src=samples_per_src,
+            src_positions=src_positions,
+            tgt_positions=tgt_positions,
+            src_orientations=src_orientations,
+            tgt_orientations=tgt_orientations,
+            src_antenna_patterns=src_antenna_patterns,
+            tgt_antenna_patterns=tgt_antenna_patterns,
+            specular_reflection=specular_reflection,
+            diffuse_reflection=diffuse_reflection,
+            refraction=refraction
+        )
+
+        delta_paths_buffer = self._field_calculator(
+            scene=scene.mi_scene,
+            wavelength=scene.wavelength,
+            paths=delta_paths_buffer,
             samples_per_src=samples_per_src,
             src_positions=src_positions,
             tgt_positions=tgt_positions,
@@ -241,14 +269,18 @@ class DeltaPathSolver:
         # It was experimentally found that discarding the invalid paths
         # before re-organizing them into high-dimensional tensors leads to
         # significant speedups
-        paths_buffer.discard_invalid()
+        static_paths_buffer.discard_invalid()
+        delta_paths_buffer.discard_invalid()
 
         # Build the path object
-        paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
-                      rx_velocities, synthetic_array, paths_buffer,
+        static_paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
+                      rx_velocities, synthetic_array, static_paths_buffer,
                       rel_ant_positions_tx, rel_ant_positions_rx)
+        delta_paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
+                rx_velocities, synthetic_array, delta_paths_buffer,
+                rel_ant_positions_tx, rel_ant_positions_rx)
 
-        return paths
+        return static_paths,delta_paths
 
     def solve_delta(self,
                  scene : Scene,
@@ -296,7 +328,7 @@ class DeltaPathSolver:
                        tgt_orientations)
 
         # Generate candidates
-        paths_buffer = self._candidate_generator.delta_call(
+        delta_paths_buffer = self._candidate_generator.delta_call(
             mi_scene=scene.mi_scene,
             delta_scene=delta_scene,
             src_positions=src_positions,
@@ -311,29 +343,30 @@ class DeltaPathSolver:
             seed=seed
         )
 
-        paths_buffer.schedule()
+        delta_paths_buffer.schedule()
         dr.eval()
 
         # Shrink the paths buffer to fit the number of paths effectively found
-        paths_buffer.shrink()
+        delta_paths_buffer.shrink()
+        dr.print("Delta number of candidates found: {}".format(delta_paths_buffer._paths_counter))
 
         # Detach the paths geometry to avoid differentiation through the
         # candidate generator
-        paths_buffer.detach_geometry()
+        delta_paths_buffer.detach_geometry()
 
         # Solve specular chains and suffixes
-        paths_buffer = self._image_method(
+        delta_paths_buffer = self._image_method(
             scene=scene.mi_scene,
-            paths=paths_buffer,
+            paths=delta_paths_buffer,
             src_positions=src_positions,
             tgt_positions=tgt_positions
             )
 
         # Compute channel coefficients and delays
-        paths_buffer = self._field_calculator(
+        delta_paths_buffer = self._field_calculator(
             scene=scene.mi_scene,
             wavelength=scene.wavelength,
-            paths=paths_buffer,
+            paths=delta_paths_buffer,
             samples_per_src=samples_per_src,
             src_positions=src_positions,
             tgt_positions=tgt_positions,
@@ -350,11 +383,11 @@ class DeltaPathSolver:
         # It was experimentally found that discarding the invalid paths
         # before re-organizing them into high-dimensional tensors leads to
         # significant speedups
-        paths_buffer.discard_invalid()
+        delta_paths_buffer.discard_invalid()
 
         # Build the path object
-        paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
-                      rx_velocities, synthetic_array, paths_buffer,
+        delta_paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
+                      rx_velocities, synthetic_array, delta_paths_buffer,
                       rel_ant_positions_tx, rel_ant_positions_rx)
 
-        return paths
+        return delta_paths
