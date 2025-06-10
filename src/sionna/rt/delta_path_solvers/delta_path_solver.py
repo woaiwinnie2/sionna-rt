@@ -8,10 +8,12 @@
 import drjit as dr
 
 from .sb_candidate_generator import SBCandidateGenerator
+from .delta_image_method import DeltaImageMethod
 from .image_method import ImageMethod
 from .field_calculator import FieldCalculator
 from .paths import Paths
 from sionna.rt import Scene
+import mitsuba as mi
 
 
 class DeltaPathSolver:
@@ -116,6 +118,7 @@ class DeltaPathSolver:
         # Instantiate the Candidate Generator
         self._candidate_generator = SBCandidateGenerator()
         # Instantiate the Image Method solver
+        self._delta_image_method = DeltaImageMethod()
         self._image_method = ImageMethod()
         # Instantiate the Field Calculator
         self._field_calculator = FieldCalculator()
@@ -138,12 +141,12 @@ class DeltaPathSolver:
         if mode not in ("evaluated", "symbolic"):
             raise ValueError("Invalid loop mode. Must be either 'evaluated'"
                              " or 'symbolic'")
-        self._image_method.loop_mode = mode
+        self._delta_image_method.loop_mode = mode
         self._field_calculator.loop_mode = mode
 
     def solve_initial(self,
                  scene : Scene,
-                 delta_scene : Scene,
+                 delta_scene : Scene, # diff with standard version
                  max_depth : int = 3,
                  max_num_paths_per_src : int = 1000000,
                  samples_per_src : int = 1000000,
@@ -187,7 +190,7 @@ class DeltaPathSolver:
                        tgt_orientations)
 
         # Generate candidates
-        static_paths_buffer,delta_paths_buffer = self._candidate_generator(
+        static_paths_buffer,delta_paths_buffer = self._candidate_generator.initial_call(
             mi_scene=scene.mi_scene,
             delta_scene=delta_scene,
             src_positions=src_positions,
@@ -208,9 +211,10 @@ class DeltaPathSolver:
 
         # Shrink the paths buffer to fit the number of paths effectively found
         static_paths_buffer.shrink()
-        dr.print("Static number of candidates found: {}".format(static_paths_buffer._paths_counter))
         delta_paths_buffer.shrink()
-        dr.print("Delta number of candidates found: {}".format(delta_paths_buffer._paths_counter))
+        if self.DO_PRINT:
+            print("Initial: Number of static candidates found: {}".format(static_paths_buffer._paths_counter))
+            print("Initial: Number of delta candidates found: {}".format(delta_paths_buffer._paths_counter))
 
         # Detach the paths geometry to avoid differentiation through the
         # candidate generator
@@ -218,15 +222,19 @@ class DeltaPathSolver:
         delta_paths_buffer.detach_geometry()
 
         # Solve specular chains and suffixes
-        static_paths_buffer = self._image_method(
+        static_paths_buffer = self._delta_image_method(
             scene=scene.mi_scene,
+            delta_scene=delta_scene,
+            is_delta=mi.Bool(False),
             paths=static_paths_buffer,
             src_positions=src_positions,
             tgt_positions=tgt_positions
             )
         
-        delta_paths_buffer = self._image_method(
+        delta_paths_buffer = self._delta_image_method(
             scene=scene.mi_scene,
+            delta_scene=delta_scene,
+            is_delta=mi.Bool(True),
             paths=delta_paths_buffer,
             src_positions=src_positions,
             tgt_positions=tgt_positions
@@ -328,7 +336,7 @@ class DeltaPathSolver:
                        tgt_orientations)
 
         # Generate candidates
-        delta_paths_buffer = self._candidate_generator.delta_call(
+        static_paths_buffer = self._candidate_generator.delta_call(
             mi_scene=scene.mi_scene,
             delta_scene=delta_scene,
             src_positions=src_positions,
@@ -343,30 +351,33 @@ class DeltaPathSolver:
             seed=seed
         )
 
-        delta_paths_buffer.schedule()
+        static_paths_buffer.schedule()
         dr.eval()
 
         # Shrink the paths buffer to fit the number of paths effectively found
-        delta_paths_buffer.shrink()
-        dr.print("Delta number of candidates found: {}".format(delta_paths_buffer._paths_counter))
+        static_paths_buffer.shrink()
+        if self.DO_PRINT:
+            print("Delta: Number of delta candidates found: {}".format(static_paths_buffer._paths_counter))
 
         # Detach the paths geometry to avoid differentiation through the
         # candidate generator
-        delta_paths_buffer.detach_geometry()
+        static_paths_buffer.detach_geometry()
 
         # Solve specular chains and suffixes
-        delta_paths_buffer = self._image_method(
+        static_paths_buffer = self._delta_image_method(
             scene=scene.mi_scene,
-            paths=delta_paths_buffer,
+            delta_scene=delta_scene,
+            is_delta=mi.Bool(True),
+            paths=static_paths_buffer,
             src_positions=src_positions,
             tgt_positions=tgt_positions
             )
 
         # Compute channel coefficients and delays
-        delta_paths_buffer = self._field_calculator(
+        static_paths_buffer = self._field_calculator(
             scene=scene.mi_scene,
             wavelength=scene.wavelength,
-            paths=delta_paths_buffer,
+            paths=static_paths_buffer,
             samples_per_src=samples_per_src,
             src_positions=src_positions,
             tgt_positions=tgt_positions,
@@ -383,11 +394,124 @@ class DeltaPathSolver:
         # It was experimentally found that discarding the invalid paths
         # before re-organizing them into high-dimensional tensors leads to
         # significant speedups
-        delta_paths_buffer.discard_invalid()
+        static_paths_buffer.discard_invalid()
 
         # Build the path object
-        delta_paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
-                      rx_velocities, synthetic_array, delta_paths_buffer,
+        static_paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
+                      rx_velocities, synthetic_array, static_paths_buffer,
                       rel_ant_positions_tx, rel_ant_positions_rx)
 
-        return delta_paths
+        return static_paths
+    
+    def solve_static(self,
+                 scene : Scene,
+                 delta_scene : Scene,
+                 max_depth : int = 3,
+                 max_num_paths_per_src : int = 1000000,
+                 samples_per_src : int = 1000000,
+                 synthetic_array : bool = True,
+                 los : bool = True,
+                 specular_reflection : bool = True,
+                 diffuse_reflection : bool = False,
+                 refraction : bool = True,
+                 seed : int = 42) -> Paths:
+        # pylint: disable=line-too-long
+        r"""
+        Executes the solver
+
+        :param scene: Scene for which to compute paths
+        :param max_depth: Maximum depth
+        :param max_num_paths_per_src: Maximum number of paths per source
+        :param samples_per_src: Number of samples per source
+        :param synthetic_array: If set to `True` (default), then the antenna arrays are applied synthetically
+        :param los: Enable line-of-sight paths
+        :param specular_reflection: Enables specular reflection
+        :param diffuse_reflection: Enables diffuse reflection
+        :param refraction: Enables refraction
+        :param seed: Seed
+
+        :return: Computed paths
+        """
+
+        # Check that the scene is all set for simulations
+        scene.all_set(radio_map=False)
+
+        # Generates sources positions and orientations
+        src_positions, src_orientations, rel_ant_positions_tx, tx_velocities =\
+                                            scene.sources(synthetic_array, True)
+        tgt_positions, tgt_orientations, rel_ant_positions_rx, rx_velocities =\
+                                            scene.targets(synthetic_array, True)
+
+        # Trace paths and compute channel impulse responses
+        src_antenna_patterns = scene.tx_array.antenna_pattern.patterns
+        tgt_antenna_patterns = scene.rx_array.antenna_pattern.patterns
+        dr.make_opaque(src_positions, tgt_positions, src_orientations,
+                       tgt_orientations)
+
+        # Generate candidates
+        static_paths_buffer = self._candidate_generator.static_call(
+            mi_scene=scene.mi_scene,
+            delta_scene=delta_scene,
+            src_positions=src_positions,
+            tgt_positions=tgt_positions,
+            samples_per_src=samples_per_src,
+            max_num_paths_per_src=max_num_paths_per_src,
+            max_depth=max_depth,
+            los=los,
+            specular_reflection=specular_reflection,
+            diffuse_reflection=diffuse_reflection,
+            refraction=refraction,
+            seed=seed
+        )
+
+        static_paths_buffer.schedule()
+        dr.eval()
+
+        # Shrink the paths buffer to fit the number of paths effectively found
+        static_paths_buffer.shrink()
+        if self.DO_PRINT:
+            print("Static: Number of static candidates found: {}".format(static_paths_buffer._paths_counter))
+
+        # Detach the paths geometry to avoid differentiation through the
+        # candidate generator
+        static_paths_buffer.detach_geometry()
+
+        # Solve specular chains and suffixes
+        static_paths_buffer = self._delta_image_method(
+            scene=scene.mi_scene,
+            delta_scene=delta_scene,
+            is_delta=mi.Bool(False),
+            paths=static_paths_buffer,
+            src_positions=src_positions,
+            tgt_positions=tgt_positions
+            )
+
+        # Compute channel coefficients and delays
+        static_paths_buffer = self._field_calculator(
+            scene=scene.mi_scene,
+            wavelength=scene.wavelength,
+            paths=static_paths_buffer,
+            samples_per_src=samples_per_src,
+            src_positions=src_positions,
+            tgt_positions=tgt_positions,
+            src_orientations=src_orientations,
+            tgt_orientations=tgt_orientations,
+            src_antenna_patterns=src_antenna_patterns,
+            tgt_antenna_patterns=tgt_antenna_patterns,
+            specular_reflection=specular_reflection,
+            diffuse_reflection=diffuse_reflection,
+            refraction=refraction
+        )
+
+        # Discard invalid paths
+        # It was experimentally found that discarding the invalid paths
+        # before re-organizing them into high-dimensional tensors leads to
+        # significant speedups
+        static_paths_buffer.discard_invalid()
+
+        # Build the path object
+        static_paths = Paths(scene, src_positions, tgt_positions, tx_velocities,
+                      rx_velocities, synthetic_array, static_paths_buffer,
+                      rel_ant_positions_tx, rel_ant_positions_rx)
+
+        return static_paths

@@ -94,6 +94,7 @@ class ImageMethod:
         # Candidates are the paths not marked as valid during the candidates
         # generation process
         valid_candidate = ~paths.valid
+        candidate_count=sum(valid_candidate.numpy())
 
         # Gather the source and target of every path
         paths_sources, paths_targets\
@@ -122,6 +123,8 @@ class ImageMethod:
 
         # Update the candidate valid status
         paths.valid |= valid_candidate
+        if self.DO_PRINT:
+            print(f"Full:{sum(paths.valid.numpy())}/{candidate_count} paths after image method")
 
         return paths
 
@@ -328,8 +331,8 @@ class ImageMethod:
         was_none = dr.full(mi.Bool, True, paths.buffer_size)
         vertex = dr.copy(paths_targets)
         normal = dr.zeros(mi.Normal3f, paths.buffer_size)
+        delta_mark=dr.full(mi.Bool, False, paths.buffer_size)
         while dr.hint(active, mode=self.loop_mode):
-
             # Depth of the next specular reflection beforehand (as we backtrack)
             next_spec_depth = find_next_spec_depth(self, paths, depth, active,
                                                    sf_start_depth)
@@ -360,7 +363,8 @@ class ImageMethod:
                                               ray_flags=mi.RayFlags.Minimal,
                                               coherent=True,
                                               active=valid_inter)
-
+            si_delta=self.delta_scene.bbox().ray_intersect(ray)[0]
+            delta_mark|=si_delta
             # Check the that the intersection is valid. It is if:
             # - There is an intersection, and
             # - The intersected primitive is the one detected during candidate
@@ -393,6 +397,10 @@ class ImageMethod:
         # suffix
         ray = spawn_ray_to(vertex, sf_source, normal)
         valid_candidate &= ~mi_scene.ray_test(ray, active=valid_candidate)
+        si_delta=self.delta_scene.bbox().ray_intersect(ray)[0]  # maked relevant for delta solving
+        delta_mark|=si_delta
+        if self.DO_PRINT:
+            dr.print(f"Std image method: {sum(delta_mark&valid_candidate.numpy())} delta path/{sum(valid_candidate.numpy())} total paths after backtracking")
         # If the candidate is valid, then update the direction of depature
         paths.set_angles_tx(-ray.d, valid_candidate)
 

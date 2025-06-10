@@ -58,7 +58,7 @@ class SBCandidateGenerator:
         self._sampler = mi.load_dict({'type': 'independent'})
         self.is_delta=None
 
-    def __call__(self,
+    def initial_call(self,
                  mi_scene : mi.Scene,
                  delta_scene: mi.Scene,
                  src_positions : mi.Point3f,
@@ -181,6 +181,72 @@ class SBCandidateGenerator:
 
         if max_depth > 0:
             self._delta_shoot_and_bounce(mi_scene,delta_scene, src_positions, tgt_positions,
+                    static_paths,delta_paths, samples_per_src, max_num_paths_per_src, max_depth,
+                    static_paths_counter_per_source,delta_paths_counter_per_source, specular_reflection,
+                    diffuse_reflection, refraction)
+
+        # Test LoS and add valid LoS paths to `paths`
+        if los:
+            self._los(mi_scene, src_positions, tgt_positions, delta_paths,
+                      delta_paths_counter_per_source)
+
+        return delta_paths
+    
+    def static_call(self,
+                 mi_scene : mi.Scene,
+                delta_scene: mi.Scene,
+                 src_positions : mi.Point3f,
+                 tgt_positions : mi.Point3f,
+                 samples_per_src : int,
+                 max_num_paths_per_src : int,
+                 max_depth : int,
+                 los : bool,
+                 specular_reflection : bool,
+                 diffuse_reflection : bool,
+                 refraction : bool,
+                 seed : int = 1) -> PathsBuffer:
+        # pylint: disable=line-too-long
+        r"""
+        Instantiates the paths buffer and runs the candidate generator
+
+        :param mi_scene: Mitsuba scene
+        :param src_positions: Positions of the sources
+        :param tgt_positions: Positions of the targets
+        :param samples_per_src: Number of samples to spawn per source
+        :param max_num_paths_per_src: Maximum number of candidates per source
+        :param max_depth: Maximum path depths
+        :param los: If set to `True`, then the LoS paths are computed
+        :param specular_reflection: If set to `True`, then the specularly reflected paths are computed
+        :param diffuse_reflection: If set to `True`, then the diffusely reflected paths are computed
+        :param refraction: If set to `True`, then the refracted paths are computed
+        :param seed: Seed for the sampler. Defaults to 1.
+
+        :return : Candidate paths
+        """
+        num_sources = dr.shape(src_positions)[1]
+        num_samples = samples_per_src*num_sources
+        max_num_paths = max_num_paths_per_src*num_sources
+
+        # Set the seed of the sampler
+        self._sampler.seed(seed, num_samples)
+
+        # Allocate memory for `max_num_paths` paths.
+        # After the shoot-and-bounce process, if the number of paths found is
+        # below `max_num_paths`, then the tensors are shrinked.
+        static_paths = PathsBuffer(max_num_paths, max_depth)
+        delta_paths = PathsBuffer(max_num_paths, max_depth)
+
+        # Counter indicating how many paths were found for each source.
+        # To ensure that the path buffer is not filled by a single or a few
+        # sources, we count the number of paths traced for each source to ensure
+        # that no more than `max_num_paths_per_src` are stored.
+        # This is a way to ensure that the buffer is equally allocated to all
+        # sources.
+        static_paths_counter_per_source = dr.zeros(mi.UInt, num_sources)
+        delta_paths_counter_per_source = dr.zeros(mi.UInt, num_sources)
+
+        if max_depth > 0:
+            self._static_shoot_and_bounce(mi_scene,delta_scene, src_positions, tgt_positions,
                     static_paths,delta_paths, samples_per_src, max_num_paths_per_src, max_depth,
                     static_paths_counter_per_source,delta_paths_counter_per_source, specular_reflection,
                     diffuse_reflection, refraction)
@@ -445,6 +511,69 @@ class SBCandidateGenerator:
                 static_paths_counter_per_source,delta_paths_counter_per_source,static_specular_chain_counter,delta_specular_chain_counter,
                 specular_reflection, diffuse_reflection, refraction,
                 self._sampler)
+            
+    def _static_shoot_and_bounce(self,
+                          mi_scene : mi.Scene,
+                          delta_scene: mi.Scene,
+                          src_positions : mi.Point3f,
+                          tgt_positions : mi.Point3f,
+                          static_paths : PathsBuffer,
+                          delta_paths : PathsBuffer,
+                          samples_per_src : int,
+                          max_num_paths_per_src : int,
+                          max_depth : int,
+                          static_paths_counter_per_source : mi.UInt,
+                          delta_paths_counter_per_source : mi.UInt,
+                          specular_reflection : bool,
+                          diffuse_reflection : bool,
+                          refraction : bool):
+        # pylint: disable=line-too-long
+        r"""
+        Executes shooting-and-bouncing of rays
+
+        The paths buffer ``path`` is updated in-place.
+
+        :param mi_scene: Mitsuba scene
+        :param src_positions: Positions of the sources
+        :param tgt_positions: Positions of the targets
+        :param paths: Buffer storing the candidate paths. Updated in-place.
+        :param samples_per_src: Number of samples spawn per source
+        :param max_num_paths_per_src: Maximum number of candidates per source
+        :param max_depth:  Maximum path depths
+        :param paths_counter_per_source: Counts the number of paths found for each source
+        :param specular_reflection: If set to `True`, then the specularly reflected paths are computed
+        :param diffuse_reflection: If set to `True`, then the diffusely reflected paths are computed
+        :param refraction: If set to `True`, then the refracted paths are computed
+        """
+
+        num_sources = dr.shape(src_positions)[1]
+
+        # Counter indicating how many occurrences of a specular chain was found.
+        # Specular chains are considered identical if they share the same
+        # hash. Taking the hash modulo the size of the following array is used
+        # to index this array and increment the counter. If the counter is > 0,
+        # then the specular chain is not considered as new and not stored.
+        # The size of the following array needs therefore to be large enough
+        # to ensure that the number of collisions stays low and that candidates
+        # are not discarded due to collisions.
+        # The size of the array is set to:
+        #  max(max_num_paths, MIN_SPEC_COUNTER_SIZE*num_sources)
+        spec_counter_size = dr.maximum(max_num_paths_per_src,
+                                       SBCandidateGenerator.MIN_SPEC_COUNT_SIZE)
+        static_specular_chain_counter = dr.zeros(mi.UInt,
+                                          spec_counter_size*num_sources)
+        delta_specular_chain_counter = dr.zeros(mi.UInt,
+                                    spec_counter_size*num_sources)
+
+
+        # Runs the shooting-and-bouncing of rays loop
+        with dr.scoped_set_flag(dr.JitFlag.OptimizeLoops, False):
+            self._static_shoot_and_bounce_loop(mi_scene,delta_scene, src_positions, tgt_positions,
+                samples_per_src, max_num_paths_per_src, max_depth, static_paths, delta_paths,
+                static_paths_counter_per_source,delta_paths_counter_per_source,static_specular_chain_counter,delta_specular_chain_counter,
+                specular_reflection, diffuse_reflection, refraction,
+                self._sampler)
+
 
 
     @dr.syntax()
@@ -492,8 +621,7 @@ class SBCandidateGenerator:
         spec_counter_size = dr.shape(static_specular_chain_counter)[0]//num_sources
 
         # Structure storing the sample data, which is used to build the paths
-        static_samples_data = SampleData(num_sources, samples_per_src, max_depth)
-        delta_samples_data = SampleData(num_sources, samples_per_src, max_depth)
+        samples_data = SampleData(num_sources, samples_per_src, max_depth)
 
         # Rays
         ray = spawn_ray_from_sources(fibonacci_lattice, samples_per_src,
@@ -535,7 +663,6 @@ class SBCandidateGenerator:
             si_delta=delta_scene.bbox().ray_intersect(ray)[0]  # maked relevant for delta solving
             is_delta |= si_delta
             active &= si_scene.is_valid()
-            static_active=active&~is_delta
             sample1 = sampler.next_1d()
             sample2 = sampler.next_2d()
             s, n = self._sample_radio_material(si_scene, ray.d, sample1,
@@ -554,12 +681,9 @@ class SBCandidateGenerator:
             transmission = int_type == InteractionType.REFRACTION
             diffuse = int_type == InteractionType.DIFFUSE
             specular_chain &= active & (specular | transmission)
+
             # Update the samples data
-            # if static_active:
-            static_samples_data.insert(depth, int_type, si_scene.shape,
-                                si_scene.prim_index, si_scene.p)
-            # if delta_active:
-            delta_samples_data.insert(depth, int_type, si_scene.shape,
+            samples_data.insert(depth, int_type, si_scene.shape,
                                 si_scene.prim_index, si_scene.p)
             ########################################################
             # Store the paths.
@@ -584,8 +708,11 @@ class SBCandidateGenerator:
                 tgt_position = dr.gather(mi.Point3f, tgt_positions, t)
                 los_ray = si_scene.spawn_ray_to(tgt_position)
                 los_blocked = mi_scene.ray_test(los_ray, active=active)
+                is_delta |= delta_scene.bbox().ray_intersect(los_ray)[0]
+
                 los_visible = ~los_blocked
-                
+                static_active=active&~is_delta
+                delta_active=active&is_delta
                 # If the interaction is valid and if the target is visible from
                 # the intersection point, then the path is marked as valid.
                 # It is also required that the target is on the same side of
@@ -614,20 +741,28 @@ class SBCandidateGenerator:
                 # counter value previous to its increment equals 0.
                 path_target_hash = self._cantor_pairing(path_hash, t)
                 counter_ind = path_target_hash % spec_counter_size
-                counter_ind += spec_counter_size*static_samples_data.src_indices
-                samples_counter = dr.scatter_inc(static_specular_chain_counter,
-                                                 counter_ind, new_specular)
-                new_specular &= (samples_counter == 0)
+                counter_ind += spec_counter_size*samples_data.src_indices
+
+                samples_counter_static = dr.scatter_inc(static_specular_chain_counter,
+                                                 counter_ind, new_specular&static_active)
+                samples_counter_delta = dr.scatter_inc(delta_specular_chain_counter,
+                                    counter_ind, new_specular&delta_active)
+                
+                new_specular_static = new_specular&(samples_counter_static == 0)
+                new_specular_delta = new_specular&(samples_counter_delta == 0)
                 # Store the paths
-                store_static = static_active & (valid | new_specular)
-                store_delta = is_delta & (valid | new_specular)
+                store_static = static_active & (valid | new_specular_static)
+                store_delta = delta_active & (valid | new_specular_delta)
                 # Increment the per source path counter
+
                 num_path_per_src_static = dr.scatter_inc(static_paths_counter_per_source,
-                                                  static_samples_data.src_indices,
+                                                  samples_data.src_indices,
                                                   store_static)
+                
                 num_path_per_src_delta = dr.scatter_inc(delta_paths_counter_per_source,
-                                    static_samples_data.src_indices,
+                                    samples_data.src_indices,
                                     store_delta)
+                
                 # If we exceeded the specified maximum number of paths,
                 # then paths are discarded
                 store_static &= num_path_per_src_static < max_num_paths_per_src
@@ -643,15 +778,9 @@ class SBCandidateGenerator:
                 #                 los_ray.d.state, store_static.state])
 
                 dr.assert_false(store_static&store_delta)
-                static_paths.add_paths(depth, static_path_ind, static_samples_data, valid, t, k_tx,
+                static_paths.add_paths(depth, static_path_ind, samples_data, valid, t, k_tx,
                                 -los_ray.d, store_static)
-                
-                # print([depth.state, static_path_ind.state, static_samples_data._src_indices.state, valid.state, t.state, k_tx.state,
-                #                 los_ray.d.state, store_static.state])
-                # print([depth.state, delta_path_ind.state, delta_samples_data._src_indices.state, valid.state, t.state, k_tx.state,
-                #                 los_ray.d.state, store_delta.state])
-                # delta_samples_data    
-                delta_paths.add_paths(depth, delta_path_ind, delta_samples_data, valid, t, k_tx,
+                delta_paths.add_paths(depth, delta_path_ind, samples_data, valid, t, k_tx,
                                 -los_ray.d, store_delta)
                 t += 1
             ####################################
@@ -665,9 +794,10 @@ class SBCandidateGenerator:
             ray = si_scene.spawn_ray(d=k_world)
             # Reset the value of specular_chain in case of a diffuse reflection
             specular_chain |= diffuse
-        if self.is_delta is not None:
-            dr.assert_false(dr.any(self.is_delta!=is_delta),"Delta mask should not change")
         self.is_delta= dr.copy(is_delta)
+        if self.DO_PRINT:
+            print(f"Shooting and bouncing done, {sum(is_delta.numpy()):.2e} delta rays/{num_samples:.2e} total rays")
+        
 
     @dr.syntax()
     def _delta_shoot_and_bounce_loop(self,
@@ -723,7 +853,6 @@ class SBCandidateGenerator:
 
         # Only delta rays are being solved
         active = dr.copy(self.is_delta)
-        is_delta=dr.full(mi.Bool, False, num_samples)
 
         # Note: here and in the inner loop, we explicitly exclude some non-state
         # variables from the loop state so that DrJit doesn't have to trace
@@ -742,8 +871,6 @@ class SBCandidateGenerator:
             si_scene = mi_scene.ray_intersect(ray, coherent=True,
                                               ray_flags=mi.RayFlags.Minimal,
                                               active=active)
-            is_delta|=delta_scene.bbox().ray_intersect(ray)[0]  # maked relevant for delta solving
-
 
             # Deactivate rays that didn't hit the scene, i.e., that bounce-out
             # of the scene
@@ -856,10 +983,8 @@ class SBCandidateGenerator:
                 samples_counter = dr.scatter_inc(delta_specular_chain_counter,
                                                  counter_ind, new_specular)
                 new_specular &= samples_counter == 0
-
                 # Store the paths
-
-                store = active & (valid | new_specular) & is_delta
+                store = active & (valid | new_specular)
 
                 # Increment the per source path counter
                 num_path_per_src = dr.scatter_inc(delta_paths_counter_per_source,
@@ -891,6 +1016,225 @@ class SBCandidateGenerator:
 
             # Reset the value of specular_chain in case of a diffuse reflection
             specular_chain |= diffuse
+
+    @dr.syntax()
+    def _static_shoot_and_bounce_loop(self,
+                               mi_scene : mi.Scene,
+                               delta_scene: mi.Scene,
+                               src_positions : mi.Point3f,
+                               tgt_positions : mi.Point3f,
+                               samples_per_src : int,
+                               max_num_paths_per_src : int,
+                               max_depth : int,
+                               static_paths : PathsBuffer,
+                               delta_paths : PathsBuffer,
+                               static_paths_counter_per_source : mi.UInt,
+                               delta_paths_counter_per_source : mi.UInt,
+                               static_specular_chain_counter : mi.UInt,
+                               delta_specular_chain_counter : mi.UInt,
+                               specular_reflection : bool,
+                               diffuse_reflection : bool,
+                               refraction : bool,
+                               sampler : mi.Sampler):  # 
+        # pylint: disable=line-too-long
+        r"""
+        Executes shooting-and-bouncing of rays
+        Almost the same as non-delta version, now the initial active_mask will start with all potential delta rays found in the initial full shoot_and_bounce
+        """
+
+        num_sources = dr.shape(src_positions)[1]
+        num_targets = dr.shape(tgt_positions)[1]
+        num_samples = samples_per_src*num_sources
+        spec_counter_size = dr.shape(delta_specular_chain_counter)[0]//num_sources
+
+        # Structure storing the sample data, which is used to build the paths
+        samples_data = SampleData(num_sources, samples_per_src, max_depth)
+        # Rays
+        ray = spawn_ray_from_sources(fibonacci_lattice, samples_per_src,
+                                    src_positions)
+
+        # Store direction of departure
+        k_tx = dr.copy(ray.d)
+
+        # Boolean indicating if the sample is a specular chain, i.e., if it
+        # consists only of specular chains.
+        specular_chain = dr.full(mi.Bool, True, num_samples)
+
+        # Hash of the paths.
+        # It is computed only for specular chains, and used to not duplicate
+        # specular chain candidates.
+        # 64bit integer is used for hashing.
+        path_hash = dr.zeros(mi.UInt64, num_samples)
+
+        # Current depth
+        depth = dr.full(mi.UInt, 1, num_samples)
+
+        # Only delta rays are being solved
+        active = ~dr.copy(self.is_delta)
+
+        # Note: here and in the inner loop, we explicitly exclude some non-state
+        # variables from the loop state so that DrJit doesn't have to trace
+        # the loop body twice to figure it out.
+        while dr.hint(active, label="shoot_and_bounce", exclude=[
+            delta_specular_chain_counter,
+            delta_paths_counter_per_source,
+        ]):
+
+            ########################################################
+            # Test intersection with the scene and evaluate the
+            # intersection
+            ########################################################
+
+            # Test intersection with the scene
+            si_scene = mi_scene.ray_intersect(ray, coherent=True,
+                                              ray_flags=mi.RayFlags.Minimal,
+                                              active=active)
+
+            # Deactivate rays that didn't hit the scene, i.e., that bounce-out
+            # of the scene
+            active &= si_scene.is_valid()
+
+            # Samples the radio material
+            sample1 = sampler.next_1d()
+            sample2 = sampler.next_2d()
+            s, n = self._sample_radio_material(si_scene, ray.d, sample1,
+                    sample2, specular_reflection, diffuse_reflection,
+                    refraction, active)
+            # Direction of propagation of scattered wave in implicit world
+            # frame
+            k_world = s.wo
+            # Interaction type
+            int_type = dr.select(active, s.sampled_component,
+                                 InteractionType.NONE)
+            # Disable paths if a NONE interaction was sampled.
+            # This happens if no interaction type is enabled
+            active &= (int_type != InteractionType.NONE)
+
+            # Is this interaction a specular reflection?
+            specular = int_type == InteractionType.SPECULAR
+
+            # Is this interaction a transmission
+            transmission = int_type == InteractionType.REFRACTION
+
+            # Is this interaction a diffuse reflection
+            diffuse = int_type == InteractionType.DIFFUSE
+
+            # Is the sample a specular chain?
+            # A specular chain consists only of specular reflections or
+            # transmission
+            specular_chain &= active & (specular | transmission)
+
+            ########################################################
+            # Update samples data
+            ########################################################
+
+            # Update the samples data
+            samples_data.insert(depth, int_type, si_scene.shape,
+                                si_scene.prim_index, si_scene.p)
+
+            ########################################################
+            # Store the paths.
+            # A path is stored if:
+            # - It is a new specular chain
+            # - It is valid, i.e., it connects to a target
+            ########################################################
+
+            # If this path is a specular chain, then we hash it to ensure it
+            # is a new paths.
+            # Hash the interaction
+            inter_hash = self._hash_intersection(si_scene.shape,
+                                                 si_scene.prim_index,
+                                                 int_type)
+            # Hash of the path
+            path_hash = self._polynomial_hashing(inter_hash, path_hash)
+
+            # Loop over all targets.
+
+            # Target index
+            t = mi.UInt(0)
+            while dr.hint(t < num_targets, label="shoot_and_bounce_inner",
+                          exclude=[
+            delta_specular_chain_counter,
+            delta_paths_counter_per_source,
+                                   ]):
+                # Position of the target with index t
+                tgt_position = dr.gather(mi.Point3f, tgt_positions, t)
+
+                # Test line-of-sight with the target from the current
+                # interaction point
+                los_ray = si_scene.spawn_ray_to(tgt_position)
+                los_blocked = mi_scene.ray_test(los_ray, active=active)
+                los_visible = ~los_blocked
+
+                # If the interaction is valid and if the target is visible from
+                # the intersection point, then the path is marked as valid.
+
+                # It is also required that the target is on the same side of
+                # the intersected surface than the incident wave.
+                # `n`` is the normal to the intersected surface oriented towards
+                # the incident half-space
+                # `los_ray.d` is from the intersection point to the target
+                target_incident_side = dr.dot(n, los_ray.d) > 0.
+                valid = los_visible & diffuse & target_incident_side
+
+                # If this path is a specular chain, then we hash it to ensure
+                # that it is a new paths.
+                # A specular chain is only considered as candidate if the
+                # intersection point is in LoS with the target. This condition
+                # is used as an heuristic to reduce the number of candidates.
+                # It also helps to reduce the number of access to the hash table
+                # storing the specular chain counter, and therefore reduces th
+                # number of collisions.
+                new_specular = specular_chain & los_visible
+
+                # A specular chain is considered as new, and therefore should
+                # be stored in the `path` structure, if its hash has not been
+                # already observed. To ensure that the path has not
+                # already been stored for the target `t`, we combine it with
+                # the path hash
+                # If the sample is a specular chain, then the counter
+                # corresponding to its hash is increased, and we check that the
+                # counter value previous to its increment equals 0.
+                path_target_hash = self._cantor_pairing(path_hash, t)
+                counter_ind = path_target_hash % spec_counter_size
+                counter_ind += spec_counter_size*samples_data.src_indices
+                samples_counter = dr.scatter_inc(delta_specular_chain_counter,
+                                                 counter_ind, new_specular)
+                new_specular &= samples_counter == 0
+                # Store the paths
+                store = active & (valid | new_specular)
+
+                # Increment the per source path counter
+                num_path_per_src = dr.scatter_inc(delta_paths_counter_per_source,
+                                                  samples_data.src_indices,
+                                                  store)
+                # If we exceeded the specified maximum number of paths,
+                # then paths are discarded
+                store &= num_path_per_src < max_num_paths_per_src
+                # Index where to store the current path.
+                path_ind = dr.scatter_inc(delta_paths.paths_counter, mi.UInt(0),
+                                          store)
+                # Store the paths
+                delta_paths.add_paths(depth, path_ind, samples_data, valid, t, k_tx,
+                                -los_ray.d, store)
+
+                t += 1
+
+            ####################################
+            # Prepare next iteration
+            ####################################
+
+            # Deactivate rays if the maximum depth is reached and
+            # the ones set as valid
+            depth += 1
+            active &= (depth <= max_depth)
+
+            # Spawn rays for next iteration
+            ray = si_scene.spawn_ray(d=k_world)
+
+            # Reset the value of specular_chain in case of a diffuse reflection
+            specular_chain |= diffuse
+
 
     def _sample_radio_material(self,
                                si : mi.SurfaceInteraction3f,

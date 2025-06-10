@@ -13,7 +13,7 @@ from sionna.rt.constants import InteractionType, MIN_SEGMENT_LENGTH
 from .paths_buffer import PathsBuffer
 
 
-class ImageMethod:
+class DeltaImageMethod:
     r"""
     Image method for evaluating specular chains and specular suffixes candidates
 
@@ -73,6 +73,8 @@ class ImageMethod:
 
     def __call__(self,
                  scene : mi.Scene,
+                 delta_scene : mi.Scene,# diff with standard version
+                 is_delta : bool,# diff with standard version
                  paths : PathsBuffer,
                  src_positions : mi.Point3f,
                  tgt_positions : mi.Point3f) -> PathsBuffer:
@@ -116,16 +118,15 @@ class ImageMethod:
         self._compute_images(paths, sf_source, sf_start_depth,  valid_candidate)
 
         # Backtrack
-        valid_candidate = self._backtrack(scene, paths, paths_targets,
+        valid_candidate = self._backtrack(scene,delta_scene,is_delta, paths, paths_targets,
                                           sf_source, sf_start_depth,
                                           valid_candidate)
 
-        # ## ## ## ## ## ##
-
         # Update the candidate valid status
         paths.valid |= valid_candidate
+        desc="Delta" if is_delta else "Static"
         if self.DO_PRINT:
-            print(f"Full:{sum(paths.valid.numpy())}/{candidate_count} paths after image method")
+            print(f"{desc}:{sum(paths.valid.numpy())}/{candidate_count} paths after image method")
 
         return paths
 
@@ -283,6 +284,8 @@ class ImageMethod:
     @dr.syntax
     def _backtrack(self,
                    mi_scene : mi.Scene,
+                   delta_scene : mi.Scene,# diff with standard version
+                    find_delta : mi.Bool,# diff with standard version, to solve static, those turning into delta are discarded. To solve delta, those turning into static are discarded
                    paths : PathsBuffer,
                    paths_targets : mi.Point3f,
                    sf_source : mi.Point3f,
@@ -309,9 +312,7 @@ class ImageMethod:
 
         :return: Updated ``valid_candidate`` array
         """
-
         max_depth = paths.max_depth
-
         @dr.syntax
         def find_next_spec_depth(self, paths, current_depth, current_active,
                                  min_depth):
@@ -324,26 +325,23 @@ class ImageMethod:
                 int_type = paths.get_interaction_type(depth, active)
                 specular = int_type == InteractionType.SPECULAR
                 active &= (~specular)
-
             return depth
-
         active = dr.copy(valid_candidate)
         depth = dr.full(mi.UInt, max_depth, paths.buffer_size)
         was_none = dr.full(mi.Bool, True, paths.buffer_size)
         vertex = dr.copy(paths_targets)
         normal = dr.zeros(mi.Normal3f, paths.buffer_size)
+        
+        delta_mark=dr.full(mi.Bool, False, paths.buffer_size)  # maked relevant for delta solving
         while dr.hint(active, mode=self.loop_mode):
-
             # Depth of the next specular reflection beforehand (as we backtrack)
             next_spec_depth = find_next_spec_depth(self, paths, depth, active,
                                                    sf_start_depth)
-
             # The intersection is initially valid if the ray is active
             # and there is an intersection
             int_type = paths.get_interaction_type(depth, active)
-            none = int_type == InteractionType.NONE
-            valid_inter = active & ~none
-
+            none_interaction = int_type == InteractionType.NONE
+            valid_inter = active & ~none_interaction
             # Read the next image.
             # If there is no specular reflection beforehand in the specular
             # suffix, then use the source as the next image
@@ -364,12 +362,14 @@ class ImageMethod:
                                               ray_flags=mi.RayFlags.Minimal,
                                               coherent=True,
                                               active=valid_inter)
-
+            
+            si_delta=delta_scene.bbox().ray_intersect(ray)[0]
+            delta_mark|=si_delta
             # Check the that the intersection is valid. It is if:
             # - There is an intersection, and
             # - The intersected primitive is the one detected during candidate
             # generation
-            # - The segment length is above a pre-defined threshold
+            # - The segment lengt is above a pre-defined threshold
             valid_inter &= si_scene.is_valid()
             expected_shape = paths.get_shape(depth, valid_inter)
             si_shape = dr.reinterpret_array(mi.UInt, si_scene.shape)
@@ -377,7 +377,6 @@ class ImageMethod:
             valid_inter &= (expected_shape == si_shape)
             valid_inter &= (expected_prim_ind == si_scene.prim_index)
             valid_inter &= (si_scene.t > MIN_SEGMENT_LENGTH)
-
             # If the intersection if valid, then stores the intersection point
             # as the path vertex, and update the direction of arrival
             paths.set_vertex(depth, si_scene.p, valid_inter)
@@ -385,19 +384,21 @@ class ImageMethod:
             # If the intersection is not valid, discard the candidate
             # If there was no intersection (none == True), then we did not
             # enter yet the specular suffix
-            valid_candidate &= valid_inter | none
-
+            valid_candidate &= valid_inter | none_interaction
             depth -= 1
             active &= (depth  >= sf_start_depth) & valid_candidate
             vertex = dr.select(valid_inter, si_scene.p, vertex)
             normal = dr.select(valid_inter, si_scene.n, normal)
-            was_none = dr.copy(none)
-
+            was_none = dr.copy(none_interaction)
         # Test visibility from the last vertex to the source of the specular
         # suffix
         ray = spawn_ray_to(vertex, sf_source, normal)
         valid_candidate &= ~mi_scene.ray_test(ray, active=valid_candidate)
+        si_delta=delta_scene.bbox().ray_intersect(ray)[0]  # maked relevant for delta solving
+        delta_mark|=si_delta
+        if self.DO_PRINT:
+            dr.print(f"Delta image method: {sum(delta_mark&valid_candidate.numpy())} delta path/{sum(valid_candidate.numpy())} total paths after backtracking")
+        valid_candidate&=(delta_mark&find_delta)|(~delta_mark&~find_delta) #make sure static got static and dynamic got dynamic
         # If the candidate is valid, then update the direction of depature
         paths.set_angles_tx(-ray.d, valid_candidate)
-
         return valid_candidate
